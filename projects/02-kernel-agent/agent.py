@@ -153,8 +153,10 @@ def grade(source, level):
                  + ". Fix that before anything else -- the simulator agrees with the reference here "
                    "and the device would not.")
         if m:
+            # Route matmul-level numeric mismatches (3 and 4) through enrich so the operand-layout
+            # / orientation guidance fires, not just raw exceptions. (From the pod reconciliation.)
             failures.append((nkibench.label(case, level),
-                             enrich(m, level=level) if level == 4 else m))
+                             enrich(m, level=level) if level in (3, 4) else m))
             continue
         passed += 1
         if level >= 3 and counted["bytes"] and {"M", "K", "N"} <= set(case):
