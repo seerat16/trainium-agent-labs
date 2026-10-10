@@ -457,6 +457,30 @@ def enrich(error_text, level=None):
                 "nl.ndarray((rows, cols), ...) and give a length-N vector the shape (1, N) or "
                 "(N, 1) depending on which axis you are reducing over.")
     if "cannot reshape array of size" in error_text:
+        if level == 3:
+            # Measured: prose telling the model NOT to reshape did not work -- it kept reshaping,
+            # and the reshape sizes blew up to 536M as it guessed. The fix that worked elsewhere in
+            # this repo is to STOP explaining and show the complete kernel. There is no reshape and
+            # no loop in a single-tile matmul; this is the whole thing.
+            return (error_text + " Do NOT reshape at all. For this single tile the operands already "
+                    "have the exact shape nc_matmul needs. Write EXACTLY this kernel, changing "
+                    "nothing but the entry-point name if needed:\n\n"
+                    "import nki\nimport nki.isa as nisa\nimport nki.language as nl\n\n"
+                    "@nki.jit\n"
+                    "def nki_matmul_basic_(lhsT, rhs):\n"
+                    "    K, M = lhsT.shape\n"
+                    "    K2, N = rhs.shape\n"
+                    "    out = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)\n"
+                    "    lhs_tile = nl.ndarray((K, M), dtype=lhsT.dtype, buffer=nl.sbuf)\n"
+                    "    rhs_tile = nl.ndarray((K, N), dtype=rhs.dtype, buffer=nl.sbuf)\n"
+                    "    nisa.dma_copy(dst=lhs_tile, src=lhsT)\n"
+                    "    nisa.dma_copy(dst=rhs_tile, src=rhs)\n"
+                    "    psum = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)\n"
+                    "    nisa.nc_matmul(dst=psum, stationary=lhs_tile, moving=rhs_tile)\n"
+                    "    res = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.sbuf)\n"
+                    "    nisa.tensor_copy(dst=res, src=psum)\n"
+                    "    nisa.dma_copy(dst=out, src=res)\n"
+                    "    return out\n")
         return (error_text + " Do NOT reshape. nc_matmul consumes its operands along the "
                 "PARTITION axis, so the layout is already what you need and reshaping fights it. "
                 "lhsT arrives as [K, M] (K on partitions, the left operand pre-transposed) and rhs "
@@ -665,7 +689,9 @@ def ask(a, prompt):
     content = msg.get("content") or ""
     finish = ch.get("finish_reason")
     if finish == "length":
-        # Do not let a budget problem look like a model failure.
+        # Do not let a budget problem look like a model failure. Record it so the loop can react
+        # by shortening the prompt (more room for the answer), not just print a warning.
+        a._last_truncated = True
         print(f"    (TRUNCATED: finish_reason=length after {len(content)} chars. The answer was "
               f"cut off, so any parse error below is the budget, not the model. Prompt is "
               f"{len(prompt)} chars; server context is the ceiling.)")
@@ -726,6 +752,7 @@ def solve(a, level, log, rep=0):
     beam = []            # top-K distinct (reward, src, feedback) kept across rounds for --beam
     for rnd in range(a.rounds):
         t0 = time.perf_counter()
+        a._last_truncated = False   # ask() sets this True if any sample hit finish_reason=length
         if a.offline:
             replies = offline_answers(level, a.samples, rnd)
         elif a.beam > 1 and beam:
@@ -817,6 +844,16 @@ def solve(a, level, log, rep=0):
             prompt = repair_prompt(level, latest[0], latest[1], a, ledger)
             print(f"  same failure {repeats}x — adding a ledger of {len(set(tried))} failed "
                   f"attempts to break the repeat")
+            continue
+        if getattr(a, "_last_truncated", False) and terse < 2:
+            # The answer was CUT OFF (finish_reason=length), so the kernel is incomplete no matter
+            # what the model intended. Measured on level 4: a 215s round truncated at ~2700 chars.
+            # A bigger budget does not help on these models -- a SHORTER prompt does, because it
+            # leaves more room for the answer. Escalate terseness and re-ask from scratch.
+            terse = min(terse + 1, 2)
+            prompt = first_prompt(level, terse, a)
+            print(f"  answer was truncated, so re-asking with a shorter prompt (terseness {terse}) "
+                  f"to leave room for the kernel")
             continue
         if not (latest[0] or "").strip():
             # Nothing came back to repair. Asking it to "fix" an empty code block produced a
