@@ -492,6 +492,25 @@ def enrich(error_text, level=None):
                 "and gives [M, N]; tensor_copy the psum tile into an sbuf tile; dma_copy that out to "
                 "the shared_hbm result. Read M and N from the shapes (M=lhsT.shape[1], "
                 "N=rhs.shape[1]), never with reshape.")
+    # The .ap() strided-view pattern is wrong (partition stride, or too few dimensions). This is the
+    # pooling idiom's hardest step, and the raw assertion is a verdict the model cycles on. Give the
+    # exact 5-entry pattern -- each [stride, count] in ELEMENTS -- built from the input shape, and
+    # tell it to build the view on the FULL (C,H,W) input tile, not a reshaped/pooled tile.
+    if level == 1 and ("invalid partition stride" in error_text or "ap() pattern" in error_text):
+        return (error_text + " Build the .ap() view on the FULL input tile (shape (C, H, W)) that "
+                "you loaded with dma_copy -- not on a reshaped or already-pooled tile. The pattern "
+                "is a list of EXACTLY FIVE [stride, count] pairs, strides measured in ELEMENTS, in "
+                "this order (read C, H, W from in_tensor.shape and let p = pool_size):\n"
+                "  view = in_tile.ap([\n"
+                "      [H * W,     C],          # partition axis: step one whole channel\n"
+                "      [p * W,     H // p],     # output row:   step down p input rows\n"
+                "      [p,         W // p],     # output col:   step across p input cols\n"
+                "      [W,         p],          # pool row:     the p rows inside one window\n"
+                "      [1,         p],          # pool col:     the p cols inside one window\n"
+                "  ])\n"
+                "Then summed = nl.sum(view, axis=[3, 4]) reduces the two window axes, giving "
+                "(C, H//p, W//p). The partition stride is H*W (a full channel), never 1. Do not add "
+                "or drop axes: it must be five pairs for a 2D pooling window.")
     m = re.search(r"module '([\w.]+)' has no attribute '(\w+)'", error_text)
     if m:
         return error_text + available_names(f"{m.group(1)}.{m.group(2)}")
